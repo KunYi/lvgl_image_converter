@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 import multiprocessing as mp
 from functools import partial
+import os
 
 try:
     from lv_img_converter import Converter
@@ -48,17 +49,63 @@ def check_allowed(filepath: Path):
         ".bin",
     ]
 
-def conv_one_file(args):
-    root, filepath, f, cf, ff, dither, bgr_mode, out_path = args
+def get_dest_path(root_path: Path, filepath: Path, out_path: Path, name: str, ff: str) -> Path:
+    """Calculate destination path for converted file"""
+    rel_path = Path()
     try:
-        root_path = filepath.parent
-        rel_path = Path()
-        try:
-            rel_path = filepath.relative_to(root).parent
-        except ValueError:
-            rel_path = root_path.relative_to(root_path.anchor)
+        rel_path = filepath.relative_to(root_path).parent
+    except ValueError:
+        rel_path = root_path.relative_to(root_path.anchor)
 
+    out_path = root_path if out_path == Path() else out_path
+    out_path = out_path.joinpath(rel_path)
+
+    file_conf = {
+        "C": {"suffix": ".c"},
+        "BIN": {"suffix": ".bin"},
+    }
+
+    return out_path.joinpath(name).with_suffix(file_conf[ff]["suffix"])
+
+def should_convert(src_path: Path, dest_path: Path, min_size: int = 100, force: bool = False) -> bool:
+    """
+    Determine if conversion is needed based on:
+    1. If destination doesn't exist
+    2. If destination file size is less than min_size bytes
+    3. If force flag is set
+
+    Args:
+        src_path: Source file path
+        dest_path: Destination file path
+        min_size: Minimum expected file size in bytes
+        force: Force conversion regardless of conditions
+
+    Returns:
+        bool: True if conversion is needed, False otherwise
+    """
+    if force:
+        return True
+
+    if not dest_path.exists():
+        return True
+
+    dest_size = dest_path.stat().st_size
+    return dest_size < min_size
+
+def conv_one_file(args):
+    root, filepath, f, cf, ff, dither, bgr_mode, out_path, force, min_size = args
+    try:
         name = filepath.stem
+        dest_path = get_dest_path(root, filepath, out_path, name, ff)
+
+        # Check if conversion is needed
+        if not should_convert(filepath, dest_path, min_size, force):
+            return filepath, "SKIPPED (size OK)", time.time()
+
+        # Ensure output directory exists
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Perform conversion
         conv = Converter(
             filepath.as_posix(), name, dither, name2const[f], cf_palette_bgr_en=bgr_mode
         )
@@ -75,22 +122,28 @@ def conv_one_file(args):
             "BIN": {"suffix": ".bin", "mode": "wb"},
         }
 
-        out_path = root_path if out_path == Path() else out_path
-        out_path = out_path.joinpath(rel_path)
-
-        out_path.mkdir(parents=True, exist_ok=True)
-
-        final_path = out_path.joinpath(name).with_suffix(file_conf[ff]["suffix"])
-
-        with open(final_path, file_conf[ff]["mode"]) as fi:
+        with open(dest_path, file_conf[ff]["mode"]) as fi:
             res = (
                 conv.get_c_code_file(name2const[f], c_arr)
                 if ff == "C"
                 else conv.get_bin_file(name2const[f])
             )
             fi.write(res)
+
+        # Verify file was created and has content
+        if not dest_path.exists():
+            return filepath, "ERROR: Failed to create output file", time.time()
+
+        if dest_path.stat().st_size < min_size:
+            dest_path.unlink()  # Remove file smaller than minimum size
+            return filepath, f"ERROR: Generated file smaller than {min_size} bytes", time.time()
+
         return filepath, "SUCCESS", time.time()
+
     except Exception as e:
+        # Clean up partial/failed output
+        if 'dest_path' in locals() and dest_path.exists():
+            dest_path.unlink()
         return filepath, f"ERROR: {str(e)}", time.time()
 
 def process_result(result, start_time, file_count, failed_pics):
@@ -99,6 +152,9 @@ def process_result(result, start_time, file_count, failed_pics):
     if status == "SUCCESS":
         print(f"{file_count:<5} {filepath} FINISHED {duration:.2f} ms")
         return 1
+    elif status.startswith("SKIPPED"):
+        print(f"{file_count:<5} {filepath} {status}")
+        return 0
     else:
         print(f"{file_count:<5} {filepath} {status} {duration:.2f} ms")
         failed_pics.append(filepath)
@@ -166,6 +222,15 @@ def parse_args():
         "-b", action="store_const", const=True, default=True, help="BGR mode"
     )
     parser.add_argument(
+        "--force", action="store_true", help="force conversion even if files are up to date"
+    )
+    parser.add_argument(
+        "--min-size",
+        type=int,
+        default=196612,
+        help="minimum size in bytes for output files (default: 196612)",
+    )
+    parser.add_argument(
         "-j",
         "--jobs",
         type=int,
@@ -202,7 +267,9 @@ class Main(object):
                             self.args.ff,
                             self.args.d,
                             self.args.b,
-                            self.output_path
+                            self.output_path,
+                            self.args.force,
+                            self.args.min_size
                         ))
             elif path.is_file() and check_allowed(path):
                 files_to_process.append((
@@ -213,7 +280,9 @@ class Main(object):
                     self.args.ff,
                     self.args.d,
                     self.args.b,
-                    self.output_path
+                    self.output_path,
+                    self.args.force,
+                    self.args.min_size
                 ))
 
         # Process files in parallel
